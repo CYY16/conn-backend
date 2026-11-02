@@ -1,0 +1,392 @@
+const User = require('../models/user');
+const crypto = require('crypto')
+const cloudinary = require('cloudinary')
+const sendEmail = require('../utils/sendEmail')
+const sendToken = require('../utils/jwtToken');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+
+exports.registerUser = async (req, res, next) => {
+    const existingUser = await User.findOne({ email: req.body.email })
+    if (existingUser) {
+        return res.status(400).json({ message: 'Email is already registered' })
+    }
+
+    const result = await cloudinary.v2.uploader.upload(req.body.avatar, {
+        folder: 'avatars',
+        width: 150,
+        crop: "scale"
+    }, (err, res) => {
+        console.log(err, res);
+    });
+    const { name, email, password, } = req.body;
+    const user = await User.create({
+        name,
+        email,
+        password,
+        avatar: {
+            public_id: result.public_id,
+            url: result.secure_url
+        },
+    })
+    //test token
+    // const token = user.getJwtToken();
+
+    // return res.status(201).json({
+    //     success: true,
+    //     user,
+    //     token
+    // })
+    sendToken(user, 200, res)
+}
+
+exports.loginUser = async (req, res, next) => {
+    const { email, password } = req.body;
+
+    // Checks if email and password is entered by user
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Please enter email & password' })
+    }
+
+
+    // Finding user in database
+
+    let user = await User.findOne({ email }).select('+password')
+    if (!user) {
+        return res.status(401).json({ message: 'Invalid Email or Password' })
+    }
+
+
+    // Checks if password is correct or not
+    const isPasswordMatched = await user.comparePassword(password);
+
+
+    if (!isPasswordMatched) {
+        return res.status(401).json({ message: 'Invalid Email or Password' })
+    }
+    const token = user.getJwtToken();
+
+    // res.status(201).json({
+    //     success: true,
+    //     token,
+    //     user
+    // });
+    user = await User.findOne({ email })
+    sendToken(user, 200, res)
+}
+
+exports.googleLogin = async (req, res, next) => {
+    const { idToken } = req.body;
+
+    // initialise here, not at the top: app.js is required before dotenv loads in server.js
+    if (!getApps().length) {
+        initializeApp({
+            credential: cert({
+                projectId: process.env.FIREBASE_PROJECT_ID,
+                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+                privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+            })
+        })
+    }
+
+    let decodedToken;
+    try {
+        decodedToken = await getAuth().verifyIdToken(idToken);
+    } catch (error) {
+        return res.status(401).json({ message: 'Google login failed' })
+    }
+    const { email, name, picture } = decodedToken;
+    // mark an existing account as a Google account (does nothing if the email is new)
+    await User.updateOne({ email }, { isGoogle: true })
+
+    let user = await User.findOne({ email })
+    if (!user) {
+        await User.create({
+            name,
+            email,
+            password: crypto.randomBytes(20).toString('hex'),
+            isGoogle: true,
+            avatar: {
+                public_id: 'google',
+                url: picture
+            },
+        })
+        // find again like loginUser, so the hashed password is not sent back
+        user = await User.findOne({ email })
+    }
+
+    sendToken(user, 200, res)
+}
+
+exports.forgotPassword = async (req, res, next) => {
+    const user = await User.findOne({ email: req.body.email });
+    if (!user) {
+        return res.status(404).json({ error: 'User not found with this email' })
+
+    }
+    // Get reset token
+    const resetToken = user.getResetPasswordToken();
+    await user.save({ validateBeforeSave: false });
+    // Create reset password url
+    const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/password/reset/${resetToken}`;
+    const message = `Your password reset token is as follow:\n\n${resetUrl}\n\nIf you have not requested this email, then ignore it.`
+    try {
+        await sendEmail({
+            email: user.email,
+            subject: 'ShopIT Password Recovery',
+            message
+        })
+
+        res.status(200).json({
+            success: true,
+            message: `Email sent to: ${user.email}`
+        })
+
+    } catch (error) {
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpire = undefined;
+        await user.save({ validateBeforeSave: false });
+        return res.status(500).json({ error: error.message })
+
+    }
+}
+
+exports.resetPassword = async (req, res, next) => {
+    console.log(req.params.token)
+    // Hash URL token
+    const resetPasswordToken = crypto.createHash('sha256').update(req.params.token).digest('hex')
+    console.log(resetPasswordToken)
+    const user = await User.findOne({
+        resetPasswordToken,
+        resetPasswordExpire: { $gt: Date.now() }
+    })
+    console.log(user)
+
+    if (!user) {
+        return res.status(400).json({ message: 'Password reset token is invalid or has been expired' })
+
+    }
+
+    if (req.body.password !== req.body.confirmPassword) {
+        return res.status(400).json({ message: 'Password does not match' })
+
+    }
+
+    // Setup new password
+    user.password = req.body.password;
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save();
+    const token = user.getJwtToken();
+    return res.status(201).json({
+        success: true,
+        token,
+        user
+    });
+
+}
+
+exports.getUserProfile = async (req, res, next) => {
+    const user = await User.findById(req.user.id);
+    console.log(user)
+
+    return res.status(200).json({
+        success: true,
+        user
+    })
+}
+
+exports.updateProfile = async (req, res, next) => {
+    const currentUser = await User.findById(req.user.id)
+    if (currentUser.isGoogle && req.body.email !== currentUser.email) {
+        return res.status(400).json({ message: 'The email of a Google account cannot be changed' })
+    }
+
+    const emailOwner = await User.findOne({ email: req.body.email, _id: { $ne: req.user.id } })
+    if (emailOwner) {
+        return res.status(400).json({ message: 'Email is already in use' })
+    }
+
+    const newUserData = {
+        name: req.body.name,
+        email: req.body.email
+    }
+
+    // Update avatar
+    if (req.body.avatar !== '') {
+        let user = await User.findById(req.user.id)
+        // console.log(user)
+        const image_id = user.avatar.public_id;
+        if (image_id !== 'google') {
+            const res = await cloudinary.v2.uploader.destroy(image_id);
+        }
+        // console.log("Res", res)
+        const result = await cloudinary.v2.uploader.upload(req.body.avatar, {
+            folder: 'avatars',
+            width: 150,
+            crop: "scale"
+        })
+
+        newUserData.avatar = {
+            public_id: result.public_id,
+            url: result.secure_url
+        }
+    }
+    const user = await User.findByIdAndUpdate(req.user.id, newUserData, {
+        new: true,
+        runValidators: true,
+    })
+    if (!user) {
+        return res.status(401).json({ message: 'User Not Updated' })
+    }
+
+    return res.status(200).json({
+        success: true,
+        user
+    })
+}
+
+exports.updatePassword = async (req, res, next) => {
+    if (!req.body.oldPassword || !req.body.password) {
+        return res.status(400).json({ message: 'Please enter old and new password' })
+    }
+    if (req.body.password.length < 6) {
+        return res.status(400).json({ message: 'Password must be at least 6 characters' })
+    }
+
+    const user = await User.findById(req.user.id).select('+password');
+    // Check previous user password
+    const isMatched = await user.comparePassword(req.body.oldPassword)
+    if (!isMatched) {
+        return res.status(400).json({ message: 'Old password is incorrect' })
+    }
+    user.password = req.body.password;
+    await user.save();
+    // const token = user.getJwtToken();
+
+    // return res.status(201).json({
+    //     success: true,
+    //     user,
+    //     token
+    // });
+    sendToken(user, 200, res)
+
+}
+
+exports.createUser = async (req, res, next) => {
+    const existingUser = await User.findOne({ email: req.body.email })
+    if (existingUser) {
+        return res.status(400).json({ message: 'Email is already registered' })
+    }
+
+    const result = await cloudinary.v2.uploader.upload(req.body.avatar, {
+        folder: 'avatars',
+        width: 150,
+        crop: "scale"
+    })
+    const { name, email, password, role } = req.body;
+    await User.create({
+        name,
+        email,
+        password,
+        role,
+        avatar: {
+            public_id: result.public_id,
+            url: result.secure_url
+        },
+    })
+    // find again like googleLogin, so the hashed password is not sent back
+    const user = await User.findOne({ email })
+
+    return res.status(201).json({
+        success: true,
+        user
+    })
+}
+
+exports.allUsers = async (req, res, next) => {
+    const users = await User.find();
+    res.status(200).json({
+        success: true,
+        users
+    })
+}
+
+exports.deleteUser = async (req, res, next) => {
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+        return res.status(401).json({ message: `User does not found with id: ${req.params.id}` })
+        // return next(new ErrorHandler(`User does not found with id: ${req.params.id}`))
+    }
+
+    // Remove avatar from cloudinary
+    const image_id = user.avatar.public_id;
+    if (image_id !== 'google') {
+        await cloudinary.v2.uploader.destroy(image_id);
+    }
+    await User.findByIdAndDelete(req.params.id);
+    return res.status(200).json({
+        success: true,
+    })
+}
+
+exports.getUserDetails = async (req, res, next) => {
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+        return res.status(400).json({ message: `User does not found with id: ${req.params.id}` })
+        // return next(new ErrorHandler(`User does not found with id: ${req.params.id}`))
+    }
+
+    res.status(200).json({
+        success: true,
+        user
+    })
+}
+
+exports.updateUser = async (req, res, next) => {
+    const emailOwner = await User.findOne({ email: req.body.email, _id: { $ne: req.params.id } })
+    if (emailOwner) {
+        return res.status(400).json({ message: 'Email is already in use' })
+    }
+
+    const newUserData = {
+        name: req.body.name,
+        email: req.body.email,
+        role: req.body.role
+    }
+
+    const user = await User.findByIdAndUpdate(req.params.id, newUserData, {
+        new: true,
+        runValidators: true,
+        // useFindAndModify: false
+    })
+
+    if (req.body.password) {
+        if (req.body.password.length < 6) {
+            return res.status(400).json({ message: 'Password must be at least 6 characters' })
+        }
+
+        // findByIdAndUpdate skips the pre('save') hook, so save() is needed to hash the password
+        const passwordUser = await User.findById(req.params.id).select('+password');
+        passwordUser.password = req.body.password;
+        await passwordUser.save();
+    }
+
+    return res.status(200).json({
+        success: true
+    })
+}
+
+exports.logout = async (req, res, next) => {
+    res.cookie('token', null, {
+        expires: new Date(Date.now()),
+        httpOnly: true
+    })
+
+    return res.status(200).json({
+        success: true,
+        message: 'Logged out'
+    })
+}
